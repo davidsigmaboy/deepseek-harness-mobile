@@ -1,13 +1,14 @@
 name: Build DSH iOS (unsigned IPA)
 
-# Compiles the DeepSeek Harness iOS app on cloud macOS/Xcode and packages an
-# unsigned IPA. The IPA is unsigned on purpose: anyone can re-sign it with a
-# free Apple ID (AltStore / Sideloadly / Scarlet / ESign / Feather) and run it
-# on their own iPhone or iPad for free.
+# Compiles the DeepSeek Harness iOS app on a cloud macOS/Xcode runner and
+# packages an unsigned IPA. The IPA is unsigned on purpose: anyone can re-sign
+# it with a free Apple ID (AltStore / Sideloadly / Scarlet / ESign / Feather)
+# and run it on their own iPhone or iPad for free.
 #
-#   push to main  -> build + upload IPA as a workflow artifact
-#   tag v*        -> build + publish the IPA as a GitHub Release
-#   workflow_dispatch -> manual build (optionally skip the IPA)
+#   push to main      -> build + upload IPA as a workflow artifact
+#   tag v*            -> build + publish the IPA as a GitHub Release
+#   workflow_dispatch -> manual build (optionally skip the IPA, or allow a
+#                        source-built rootfs for testing only)
 
 on:
   push:
@@ -20,7 +21,11 @@ on:
         type: boolean
         default: true
       force_rootfs:
-        description: "Ignore the rootfs cache and rebuild the guest image"
+        description: "Ignore the rootfs cache and restore the pinned rootfs again"
+        type: boolean
+        default: false
+      allow_source_rootfs:
+        description: "If the pinned rootfs cannot be restored, build it from source (TESTING ONLY: hash will not match the pinned manifest; the IPA is marked SOURCE-ROOTFS and cannot be released)"
         type: boolean
         default: false
 
@@ -40,7 +45,9 @@ env:
 jobs:
   build:
     name: Build unsigned IPA
-    runs-on: macos-15
+    # The pinned upstream project is generated for Xcode 26+ (LastUpgradeCheck
+    # 2700); macos-15 only ships Xcode 16.x and cannot be used.
+    runs-on: macos-26
     timeout-minutes: 360
 
     steps:
@@ -52,13 +59,18 @@ jobs:
       - name: Fetch pinned upstream source
         run: bash scripts/fetch-upstream.sh
 
-      - name: Select newest Xcode
+      - name: Select newest Xcode (must be 26+)
         run: |
           set -euo pipefail
           XC="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
           sudo xcode-select -s "$XC/Contents/Developer"
           echo "selected: $XC"
           xcodebuild -version
+          MAJOR="$(xcodebuild -version | awk 'NR==1{split($2,v,"."); print v[1]}')"
+          if [ "${MAJOR:-0}" -lt 26 ]; then
+            echo "error: Xcode ${MAJOR} is too old; the project needs Xcode 26+" >&2
+            exit 1
+          fi
 
       - name: Install build tools (meson ninja lld libarchive)
         run: |
@@ -76,50 +88,66 @@ jobs:
           fi
           ruby -e 'require "xcodeproj"; puts "xcodeproj #{Xcodeproj::VERSION}"'
 
-      - name: Cache guest rootfs
+      - name: Restore guest rootfs cache
         id: rootfs-cache
         if: ${{ github.event.inputs.force_rootfs != 'true' }}
         uses: actions/cache@v4
         with:
           path: upstream/build/root.tar.gz
-          key: dsh-rootfs-${{ hashFiles('UPSTREAM') }}
+          # Key covers the upstream pin AND local patches, so a patch change
+          # cannot silently reuse a stale rootfs.
+          key: dsh-rootfs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('UPSTREAM', 'scripts/fetch-upstream.sh', 'patches/*.patch') }}
 
       - name: Build iSH-ARM64 emulator
         working-directory: upstream
         run: make emulator
 
-      - name: Restore pinned guest rootfs (fast path)
+      - name: Restore pinned guest rootfs
         id: pinned-rootfs
-        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        if: ${{ steps.rootfs-cache.outputs.cache-hit != 'true' }}
         working-directory: upstream
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/restore-pinned-rootfs.py --output build/root.tar.gz
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          python3 scripts/restore-pinned-rootfs.py --output build/root.tar.gz
 
-      - name: Build guest rootfs from source (fallback)
-        if: steps.rootfs-cache.outputs.cache-hit != 'true' && steps.pinned-rootfs.outcome != 'success'
+      - name: Build guest rootfs from source (opt-in fallback)
+        id: source-rootfs
+        if: ${{ steps.rootfs-cache.outputs.cache-hit != 'true' && steps.pinned-rootfs.outcome != 'success' && github.event.inputs.allow_source_rootfs == 'true' }}
         working-directory: upstream
         run: make rootfs
 
-      - name: Sync lifecycle manifest with bundled rootfs
+      - name: Verify guest rootfs against pinned manifest
         working-directory: upstream
+        env:
+          SOURCE_ROOTFS: ${{ steps.source-rootfs.outcome == 'success' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           ls -lh build/root.tar.gz
           shasum -a 256 build/root.tar.gz
           python3 - <<'PY'
-          import hashlib, json
+          import hashlib, json, os, sys
           from pathlib import Path
           digest = hashlib.sha256(Path("build/root.tar.gz").read_bytes()).hexdigest()
-          manifest = Path("app/SessionLifecycle.bundle/manifest.json")
-          data = json.loads(manifest.read_text())
-          if data.get("rootfs_sha256") != digest:
-              data["rootfs_sha256"] = digest
-              manifest.write_text(json.dumps(data, indent=2) + "\n")
-              print("updated manifest rootfs_sha256 ->", digest)
-          else:
-              print("manifest already matches:", digest)
+          expected = json.loads(Path("app/SessionLifecycle.bundle/manifest.json").read_text())["rootfs_sha256"]
+          if digest == expected:
+              print("rootfs matches pinned manifest:", digest)
+              sys.exit(0)
+          if os.environ.get("SOURCE_ROOTFS") == "true":
+              print("WARNING: source-built rootfs does not match the pinned manifest", file=sys.stderr)
+              print(f"  built    {digest}", file=sys.stderr)
+              print(f"  expected {expected}", file=sys.stderr)
+              Path("build/SOURCE_ROOTFS").write_text(digest + "\n")
+              sys.exit(0)
+          print(f"error: rootfs {digest} does not match pinned {expected}.", file=sys.stderr)
+          print("Refusing to package: the lifecycle manifest pins the shipped rootfs, and a",
+                file=sys.stderr)
+          print("different rootfs would cause an unintended data migration on user devices.",
+                file=sys.stderr)
+          sys.exit(1)
           PY
 
       - name: Generate Xcode project
@@ -158,16 +186,25 @@ jobs:
 
           APP="build/DSH.xcarchive/Products/Applications/DSH.app"
           [ -d "$APP" ] || { echo "error: $APP not found" >&2; exit 1; }
+          [ -f "$APP/root.tar.gz" ] || { echo "error: root.tar.gz not bundled in $APP" >&2; exit 1; }
           ls -lh "$APP/root.tar.gz"
+
+          SUFFIX=""
+          if [ -f build/SOURCE_ROOTFS ]; then SUFFIX="-SOURCE-ROOTFS"; fi
+          IPA_NAME="DSH-${VERSION}-build${BUILD_NO}${SUFFIX}-unsigned.ipa"
 
           rm -rf build/ipa
           mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/
           find build/ipa -name '._*' -delete
-
-          IPA_NAME="DSH-${VERSION}-build${BUILD_NO}-unsigned.ipa"
           ( cd build/ipa && zip -qry "../${IPA_NAME}" Payload )
-          shasum -a 256 "build/${IPA_NAME}" | tee build/ipa.sha256
+
+          # Checksum file uses bare names so `shasum -a 256 -c ipa.sha256` works
+          # from the directory where the IPA was downloaded.
+          ( cd build && shasum -a 256 "$IPA_NAME" > ipa.sha256 && cat ipa.sha256 )
+
+          unzip -l "build/${IPA_NAME}" | grep -q '/root.tar.gz$' \
+            || { echo "error: root.tar.gz missing from IPA" >&2; exit 1; }
 
           echo "ipa_name=${IPA_NAME}" >> "$GITHUB_OUTPUT"
 
@@ -186,8 +223,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IPA_NAME: ${{ steps.package.outputs.ipa_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if [ -f upstream/build/SOURCE_ROOTFS ]; then
+            echo "error: refusing to publish a source-built rootfs" >&2
+            exit 1
+          fi
           cat > release-notes.md <<'EOF'
           ## DeepSeek Harness for iOS (unsigned IPA)
 
@@ -208,11 +250,15 @@ jobs:
           on the device (Alpine Linux + Node.js inside an embedded iSH-ARM64
           emulator); only model inference calls the online API you configure.
 
-          Verify the download:
-          `shasum -a 256 DSH-*.ipa` must match `ipa.sha256`.
+          Verify the download (in the folder with both files):
+          `shasum -a 256 -c ipa.sha256`
           EOF
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "DeepSeek Harness iOS ${GITHUB_REF_NAME}" \
-            --notes-file release-notes.md \
-            "upstream/build/${IPA_NAME}#${IPA_NAME}" \
-            upstream/build/ipa.sha256
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "upstream/build/${IPA_NAME}" upstream/build/ipa.sha256 --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              --title "DeepSeek Harness iOS ${TAG}" \
+              --notes-file release-notes.md \
+              "upstream/build/${IPA_NAME}" upstream/build/ipa.sha256
+          fi
