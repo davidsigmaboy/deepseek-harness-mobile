@@ -70,8 +70,10 @@ make ipa        # unsigned .xcarchive in upstream/build/
 
 ## License and credits
 
-**GPL-3.0** — the app statically links the GPLv3 iSH/iSH-ARM64 emulator, so
-the whole app is GPL. See [LICENSE](LICENSE).
+The build scripts in this repo are BSD-3-Clause (see [LICENSE](LICENSE)).
+**The IPA this pipeline produces is a GPL-3.0 work** — it statically links the
+GPLv3 iSH/iSH-ARM64 emulator, and the app sources are fetched from the
+GPL-licensed upstream recorded in [UPSTREAM](UPSTREAM). See [NOTICE](NOTICE.md).
 
 - [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — the agent harness (MIT)
 - [everettjf/dsh-ios](https://github.com/everettjf/dsh-ios) — original iOS integration
