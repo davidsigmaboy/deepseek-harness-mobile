@@ -1,0 +1,8 @@
+# Pinned upstream source for the DSH iOS app.
+# The GitHub Actions workflow fetches this exact commit and builds it into an
+# unsigned IPA. Bump UPSTREAM_SHA when you want a newer upstream build.
+UPSTREAM_REPO=wjc19980523-glitch/dsh-ios-ipa
+UPSTREAM_SHA=6e48c9610cd9e6e3c7782f9d9bfcc43cc122d3c8
+UPSTREAM_URL=https://github.com/wjc19980523-glitch/dsh-ios-ipa
+# Upstream of the upstream: the original iOS integration.
+UPSTREAM_OF_RECORD=https://github.com/everettjf/dsh-ios
