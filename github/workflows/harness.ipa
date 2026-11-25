@@ -1,0 +1,218 @@
+name: Build DSH iOS (unsigned IPA)
+
+# Compiles the DeepSeek Harness iOS app on cloud macOS/Xcode and packages an
+# unsigned IPA. The IPA is unsigned on purpose: anyone can re-sign it with a
+# free Apple ID (AltStore / Sideloadly / Scarlet / ESign / Feather) and run it
+# on their own iPhone or iPad for free.
+#
+#   push to main  -> build + upload IPA as a workflow artifact
+#   tag v*        -> build + publish the IPA as a GitHub Release
+#   workflow_dispatch -> manual build (optionally skip the IPA)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      build_ipa:
+        description: "Package the unsigned IPA after building"
+        type: boolean
+        default: true
+      force_rootfs:
+        description: "Ignore the rootfs cache and rebuild the guest image"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dsh-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch pinned upstream source
+        run: bash scripts/fetch-upstream.sh
+
+      - name: Select newest Xcode
+        run: |
+          set -euo pipefail
+          XC="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XC/Contents/Developer"
+          echo "selected: $XC"
+          xcodebuild -version
+
+      - name: Install build tools (meson ninja lld libarchive)
+        run: |
+          set -euo pipefail
+          brew install meson ninja lld libarchive
+          LLD_BIN="$(brew --prefix lld)/bin"
+          echo "$LLD_BIN" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=$(brew --prefix libarchive)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+
+      - name: Ensure xcodeproj gem
+        run: |
+          set -euo pipefail
+          if ! ruby -e 'require "xcodeproj"' 2>/dev/null; then
+            gem install xcodeproj --no-document || sudo gem install xcodeproj --no-document
+          fi
+          ruby -e 'require "xcodeproj"; puts "xcodeproj #{Xcodeproj::VERSION}"'
+
+      - name: Cache guest rootfs
+        id: rootfs-cache
+        if: ${{ github.event.inputs.force_rootfs != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: upstream/build/root.tar.gz
+          key: dsh-rootfs-${{ hashFiles('UPSTREAM') }}
+
+      - name: Build iSH-ARM64 emulator
+        working-directory: upstream
+        run: make emulator
+
+      - name: Restore pinned guest rootfs (fast path)
+        id: pinned-rootfs
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        working-directory: upstream
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/restore-pinned-rootfs.py --output build/root.tar.gz
+
+      - name: Build guest rootfs from source (fallback)
+        if: steps.rootfs-cache.outputs.cache-hit != 'true' && steps.pinned-rootfs.outcome != 'success'
+        working-directory: upstream
+        run: make rootfs
+
+      - name: Sync lifecycle manifest with bundled rootfs
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          ls -lh build/root.tar.gz
+          shasum -a 256 build/root.tar.gz
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          digest = hashlib.sha256(Path("build/root.tar.gz").read_bytes()).hexdigest()
+          manifest = Path("app/SessionLifecycle.bundle/manifest.json")
+          data = json.loads(manifest.read_text())
+          if data.get("rootfs_sha256") != digest:
+              data["rootfs_sha256"] = digest
+              manifest.write_text(json.dumps(data, indent=2) + "\n")
+              print("updated manifest rootfs_sha256 ->", digest)
+          else:
+              print("manifest already matches:", digest)
+          PY
+
+      - name: Generate Xcode project
+        working-directory: upstream
+        run: make project
+
+      - name: Archive app (unsigned)
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project DSH.xcodeproj \
+            -scheme DSH \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/DSH.xcarchive" \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            archive
+
+      - name: Package unsigned IPA
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_ipa }}
+        id: package
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^MARKETING_VERSION = //p' app/AppDSH.xcconfig | tr -d ' \r')"
+          BUILD_NO="$(sed -n 's/^CURRENT_PROJECT_VERSION = //p' app/AppDSH.xcconfig | tr -d ' \r')"
+          echo "version=$VERSION build=$BUILD_NO"
+
+          APP="build/DSH.xcarchive/Products/Applications/DSH.app"
+          [ -d "$APP" ] || { echo "error: $APP not found" >&2; exit 1; }
+          ls -lh "$APP/root.tar.gz"
+
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          find build/ipa -name '._*' -delete
+
+          IPA_NAME="DSH-${VERSION}-build${BUILD_NO}-unsigned.ipa"
+          ( cd build/ipa && zip -qry "../${IPA_NAME}" Payload )
+          shasum -a 256 "build/${IPA_NAME}" | tee build/ipa.sha256
+
+          echo "ipa_name=${IPA_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        if: ${{ success() && (github.event_name != 'workflow_dispatch' || inputs.build_ipa) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-unsigned-ipa
+          path: |
+            upstream/build/${{ steps.package.outputs.ipa_name }}
+            upstream/build/ipa.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tags)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.build_ipa) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IPA_NAME: ${{ steps.package.outputs.ipa_name }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          ## DeepSeek Harness for iOS (unsigned IPA)
+
+          This IPA is **unsigned**. Install it for free by re-signing it with
+          your own Apple ID:
+
+          1. **Sideloadly / AltStore / Scarlet / ESign / Feather** — drag this
+             IPA in, sign in with a free Apple ID, install to your device.
+             Free accounts produce a 7-day certificate: re-sign once a week
+             (AltStore/Feather can refresh automatically on the same Wi-Fi).
+             A paid Apple Developer account signs for one year instead.
+          2. On the device: Settings ▸ General ▸ VPN & Device Management ▸
+             trust your developer profile; enable Developer Mode
+             (Settings ▸ Privacy & Security) if iOS asks.
+          3. Open DSH and configure your own model API key in the app.
+
+          Requirements: iOS/iPadOS 16 or later. The agent harness runs entirely
+          on the device (Alpine Linux + Node.js inside an embedded iSH-ARM64
+          emulator); only model inference calls the online API you configure.
+
+          Verify the download:
+          `shasum -a 256 DSH-*.ipa` must match `ipa.sha256`.
+          EOF
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "DeepSeek Harness iOS ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            "upstream/build/${IPA_NAME}#${IPA_NAME}" \
+            upstream/build/ipa.sha256
